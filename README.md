@@ -16,7 +16,7 @@ If this repository is useful for your research, please consider starring it.
 
 ## Introduction
 
-![framework](assets/2-method.pdf)
+![framework](assets/2-method.png)
 
 TRUST studies agentic tool-calling decisions through uncertainty-aligned reinforcement learning. Instead of only optimizing task success after a tool trajectory is completed, TRUST explicitly models the next-action decision of whether the agent should answer directly, call a tool, ask the user for more information, or refuse. This release keeps the reproducible core needed to run the main annotation and training pipeline described in the paper.
 
