@@ -12,7 +12,6 @@ outputs/
 
 # Large / non-code release-excluded artifacts
 *.pdf
-assets/
 
 # Local review / scratch docs not needed for the code release
 TRUST_code_pdf_alignment_review.md
