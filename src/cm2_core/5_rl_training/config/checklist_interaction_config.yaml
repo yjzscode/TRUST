@@ -1,0 +1,14 @@
+interaction:
+  - name: "checklist"
+    class_name: "verl.interactions.checklist_interaction.ChecklistInteraction"
+    config:
+      sglang_url:
+        - ${oc.env:JUDGE_API_URL,http://127.0.0.1:10001/v1/chat/completions}
+      sglang_model: ${oc.env:LLM_AS_A_JUDGE_NAME,Qwen/Qwen3-4B-Instruct-2507}
+      retry_times: 2
+      semaphore_size: 500
+      temperature: 0.6
+      top_p: 0.8
+      max_new_tokens: 6000
+      max_tokens: 6000
+      timeout: 1200

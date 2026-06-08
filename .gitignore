@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environments and IDE files
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime outputs
+outputs/
+
+# Large / non-code release-excluded artifacts
+*.pdf
+assets/
+
+# Local review / scratch docs not needed for the code release
+TRUST_code_pdf_alignment_review.md
+v3_judger_labeler_prompts.md
+
+# Data files that should not be uploaded with the code release
+data/when2call_official/
+
+# Optional local logs / checkpoints
+*.log
+wandb/
+ray_results/

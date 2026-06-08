@@ -1,0 +1,28 @@
+job:
+  target: when2call_grpo
+env:
+  vars:
+    CONDA_ENV_TRAIN: base
+train:
+  MODEL: /mnt/shared-storage-user/ai4good1-share/zhouyijin/models/Qwen/Qwen3-4B-Thinking-2507
+  TRAINER_PROJECT_NAME: when2call_grpo_8H
+  TRAINER_EXPERIMENT_NAME: when2call_ablation_full_no_neg_rollout_mean
+  TRAIN_OUTPUT_ROOT: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal
+  TRAINER_DEFAULT_LOCAL_DIR: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/checkpoints/when2call/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
+  TENSORBOARD_DIR: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/tensorboard/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
+  WHEN2CALL_GRPO_OUTPUT_DIR: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/data/when2call_official/grpo
+  RAY_TMPDIR: /mnt/shared-storage-user/zhouyijin/tmp
+  REWARD_NEG_ROUTE_MODE: none
+  REWARD_DROP_COMPONENTS: ""
+  TOTAL_EPOCHS: 2
+  BATCH_SIZE: 16
+  N_SAMPLES: 16
+  NUM_CPUS: 32
+  NUM_GPUS: 4
+  MAX_RESPONSE: 1024
+  ROLLOUT_MAX_MODEL_LEN: 3072
+  ROLLOUT_MAX_BATCHED_TOKENS: 6144
+  ROLLOUT_MAX_NUM_SEQS: 32
+paths:
+  output_root: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal
+  log_root: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/logs
