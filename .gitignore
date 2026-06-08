@@ -20,7 +20,7 @@ TRUST_code_pdf_alignment_review.md
 v3_judger_labeler_prompts.md
 
 # Data files that should not be uploaded with the code release
-data/when2call_official/
+# data/when2call_official/
 
 # Optional local logs / checkpoints
 *.log
