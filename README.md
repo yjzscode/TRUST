@@ -39,7 +39,7 @@ Intentionally excluded from this release:
 
 ```bash
 git clone https://github.com/yjzscode/TRUST
-cd formal_version_open
+cd TRUST
 ```
 
 ### 2. Create the environment
@@ -75,7 +75,7 @@ Then edit the bundled configs under `configs/train/` and replace placeholder val
 All commands below assume you are in this directory:
 
 ```bash
-cd /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open
+cd TRUST
 ```
 
 ### 1. Build key-turn annotation and mixed training data
