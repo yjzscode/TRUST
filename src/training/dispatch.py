@@ -63,7 +63,7 @@ def run_training_job(cfg: dict[str, Any]) -> int:
         "FORMAL_OUTPUT_ROOT": cfg.get("paths", {}).get("output_root", paths.outputs),
         "FORMAL_LOG_ROOT": cfg.get("paths", {}).get("log_root", paths.logs),
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV": 0,
-        "RAY_TMPDIR": "/mnt/shared-storage-user/zhouyijin/tmp",
+        "RAY_TMPDIR": "/tmp/trust_ray",
     }
     common_env.update(env_cfg.get("vars", {}))
 

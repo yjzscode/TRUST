@@ -1,16 +1,12 @@
-"""PPL-aware RewardManager for GRPO.
+"""PPL-aware reward manager for When2Call GRPO.
 
-Usage in verl config:
-  reward.reward_manager.source=importlib
-  reward.reward_manager.name=PPLRewardManager
-  reward.reward_manager.module.path=$ROOT/train/ppl_reward_manager.py
+This reward manager enriches each rollout sample with:
+1. runtime sequence-level PPL / normalized UQ from rollout logprobs
+2. group-level margin terms ``ppl_gt`` and ``ppl_neg`` used by
+   ``src/v2/train/reward_when2call.py``
 
-This manager does two things:
-1) runtime_uq_value from rollout sequence logprobs (same as before)
-2) strict per-sample GT-vs-NEG sequence-level PPL scoring on routed samples:
-   - 25%: GT + hard-negative
-   - 25%: GT + random-negative
-   - 50%: no strict margin term
+The open-source release uses the current VERL ``workers.reward_manager`` API,
+so registration must happen through ``verl.workers.reward_manager.register``.
 """
 from __future__ import annotations
 
@@ -22,36 +18,81 @@ import numbers
 import os
 import random
 import re
-import time
+from collections import defaultdict
 from typing import Any
 
 import torch
-import asyncio
-from verl import DataProto
-from verl.experimental.reward.reward_loop import register
-from verl.experimental.reward.reward_loop.base import RewardLoopManagerBase
-from verl.utils.reward_score import default_compute_score
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from verl import DataProto
+from verl.utils.reward_score import default_compute_score
+from verl.workers.reward_manager import register
+from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-@register("ppl_uq")
-class PPLRewardManager(RewardLoopManagerBase):
-    """NaiveRewardManager + runtime sequence-PPL UQ injection from rollout logprobs."""
+def _maybe_json_loads(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return value
+        try:
+            return json.loads(stripped)
+        except Exception:
+            return value
+    return value
 
-    def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
-        super().__init__(config, tokenizer)
+
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    value = _maybe_json_loads(value)
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_list(value: Any) -> list[Any]:
+    value = _maybe_json_loads(value)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        try:
+            converted = value.tolist()
+        except Exception:
+            converted = None
+        if isinstance(converted, list):
+            return converted
+    return []
+
+
+@register("ppl_uq")
+class PPLRewardManager(AbstractRewardManager):
+    """Inject runtime PPL/UQ and margin terms for When2Call GRPO."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        num_examine: int,
+        compute_score=None,
+        reward_fn_key: str = "data_source",
+        **kwargs: Any,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.num_examine = num_examine
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.reward_router_address = reward_router_address
-        self.reward_model_tokenizer = reward_model_tokenizer
+        self.reward_fn_key = reward_fn_key
+        self.reward_router_address = kwargs.get("reward_router_address")
+        self.reward_model_tokenizer = kwargs.get("reward_model_tokenizer")
+
         self._hard_negative_map = {
-            "A": "B",  # direct -> tool_call
-            "B": "A",  # tool_call -> direct
-            "C": "A",  # ask -> direct
-            "D": "C",  # cannot -> ask
+            "A": "B",
+            "B": "A",
+            "C": "A",
+            "D": "C",
         }
         self._rand = random.Random(0)
         self._tau = float(os.getenv("REWARD_TAU", "0.10"))
@@ -60,22 +101,20 @@ class PPLRewardManager(RewardLoopManagerBase):
         if self._neg_route_mode not in ("default", "none"):
             logger.warning("Unknown REWARD_NEG_ROUTE_MODE=%s, fallback to default", self._neg_route_mode)
             self._neg_route_mode = "default"
-        self._group_margin_enabled = os.getenv("REWARD_GROUP_MARGIN_ENABLE", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-        self._group_margin_timeout_s = float(os.getenv("REWARD_GROUP_MARGIN_TIMEOUT_S", "2.0"))
-        self._group_margin_expected = self._infer_group_margin_expected(config)
-        self._group_margin_state: dict[str, dict[str, Any]] = {}
+
+        self._group_margin_expected = self._infer_group_margin_expected()
         self._strict_model_path = os.getenv("STRICT_PPL_MODEL_PATH", os.getenv("MODEL", ""))
         self._strict_device = os.getenv("STRICT_PPL_DEVICE", "cpu")
-        self._strict_enabled = bool(self._strict_model_path)
+        self._strict_enabled = bool(self._strict_model_path) and self._neg_route_mode != "none"
         self._strict_tokenizer = None
         self._strict_model = None
         if self._strict_enabled:
             try:
-                logger.warning("Loading strict PPL scorer model from %s on %s", self._strict_model_path, self._strict_device)
+                logger.warning(
+                    "Loading strict PPL scorer model from %s on %s",
+                    self._strict_model_path,
+                    self._strict_device,
+                )
                 self._strict_tokenizer = AutoTokenizer.from_pretrained(
                     self._strict_model_path,
                     trust_remote_code=True,
@@ -92,52 +131,41 @@ class PPLRewardManager(RewardLoopManagerBase):
                 self._strict_enabled = False
 
     @staticmethod
-    def _infer_group_margin_expected(config) -> int:
-        raw = os.getenv("REWARD_GROUP_MARGIN_EXPECTED_SIZE", "").strip()
-        if raw:
+    def _infer_group_margin_expected() -> int:
+        for key in ("REWARD_GROUP_MARGIN_EXPECTED_SIZE", "N_SAMPLES"):
+            raw = os.getenv(key, "").strip()
+            if not raw:
+                continue
             try:
-                val = int(raw)
-                if val > 0:
-                    return val
+                value = int(raw)
             except ValueError:
-                pass
-        try:
-            val = int(config.actor_rollout_ref.rollout.n)
-            if val > 0:
-                return val
-        except Exception:
-            pass
+                continue
+            if value > 0:
+                return value
         return 1
 
     def _compute_seq_ppl_and_uq(self, data_item) -> tuple[float | None, float | None]:
-        """Compute sequence-level PPL and normalized UQ from rollout token logprobs.
-
-        Keep consistent with eval `ppl` mode:
-        1) sequence PPL from per-token logprobs
-        2) normalized to [0, 1] with `ppl_normalized`
-        """
         try:
             batch = data_item.batch
             if "rollout_log_probs" not in batch:
                 return None, None
 
-            response_ids = batch["responses"]
-            response_length = response_ids.shape[-1]
-            valid_length = int(batch["attention_mask"][-response_length:].sum())
+            prompt_ids = batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            valid_response_length = int(batch["attention_mask"][prompt_length:].sum())
             rollout_lp = batch["rollout_log_probs"]
-
-            if rollout_lp is None or valid_length <= 0:
+            if rollout_lp is None or valid_response_length <= 0:
                 return None, None
 
             from uq.ppl import ppl_from_token_logprobs, ppl_normalized
 
-            token_logprobs = rollout_lp[:valid_length]
+            token_logprobs = rollout_lp[:valid_response_length]
             if hasattr(token_logprobs, "tolist"):
                 token_logprobs = token_logprobs.tolist()
-            vals = [float(x) for x in token_logprobs]
-            if not vals:
+            values = [float(x) for x in token_logprobs]
+            if not values:
                 return None, None
-            seq_ppl = ppl_from_token_logprobs(vals)
+            seq_ppl = ppl_from_token_logprobs(values)
             uq = ppl_normalized(seq_ppl)
             return float(seq_ppl), float(uq)
         except Exception:
@@ -145,23 +173,23 @@ class PPLRewardManager(RewardLoopManagerBase):
             return None, None
 
     @staticmethod
-    def _rollout_key(extra_info: dict, data_item) -> str:
+    def _rollout_key(extra_info: dict[str, Any], data_item) -> str:
         idx = extra_info.get("idx")
         if idx is not None:
             return f"idx:{idx}"
-        q = data_item.non_tensor_batch.get("question", "")
-        return f"q:{hashlib.md5(str(q).encode('utf-8')).hexdigest()}"
+        question = data_item.non_tensor_batch.get("question", "")
+        return f"q:{hashlib.md5(str(question).encode('utf-8')).hexdigest()}"
 
     @staticmethod
-    def _group_key(extra_info: dict, data_item) -> str:
+    def _group_key(extra_info: dict[str, Any], data_item) -> str:
         uid = data_item.non_tensor_batch.get("uid")
         if uid:
             return f"uid:{uid}"
         idx = extra_info.get("idx")
         if idx is not None:
             return f"idx:{idx}"
-        q = data_item.non_tensor_batch.get("question", "")
-        return f"q:{hashlib.md5(str(q).encode('utf-8')).hexdigest()}"
+        question = data_item.non_tensor_batch.get("question", "")
+        return f"q:{hashlib.md5(str(question).encode('utf-8')).hexdigest()}"
 
     @staticmethod
     def _letter_from_gt(ground_truth: str) -> str:
@@ -180,8 +208,8 @@ class PPLRewardManager(RewardLoopManagerBase):
     def _route_type(self, key: str) -> str:
         if self._neg_route_mode == "none":
             return "none"
-        h = hashlib.md5(key.encode("utf-8")).digest()
-        u = int.from_bytes(h[:8], "big") / float(2**64)
+        digest = hashlib.md5(key.encode("utf-8")).digest()
+        u = int.from_bytes(digest[:8], "big") / float(2**64)
         if u < 0.25:
             return "hard"
         if u < 0.50:
@@ -195,18 +223,19 @@ class PPLRewardManager(RewardLoopManagerBase):
         return self._rand.choice(choices)
 
     @staticmethod
-    def _render_prompt_text(non_tensor_batch: dict) -> str:
-        prompt = non_tensor_batch.get("prompt")
-        if isinstance(prompt, list):
+    def _render_prompt_text(non_tensor_batch: dict[str, Any]) -> str:
+        prompt = _coerce_list(non_tensor_batch.get("prompt"))
+        if prompt:
             lines = []
-            for m in prompt:
-                if isinstance(m, dict):
-                    role = str(m.get("role", "user")).strip()
-                    content = str(m.get("content", "")).strip()
+            for message in prompt:
+                if isinstance(message, dict):
+                    role = str(message.get("role", "user")).strip()
+                    content = str(message.get("content", "")).strip()
                     lines.append(f"{role}: {content}")
-            return "\n".join(lines).strip()
-        q = non_tensor_batch.get("question")
-        return str(q or "").strip()
+            if lines:
+                return "\n".join(lines).strip()
+        question = non_tensor_batch.get("question")
+        return str(question or "").strip()
 
     @staticmethod
     def _action_from_letter(letter: str) -> str:
@@ -220,11 +249,13 @@ class PPLRewardManager(RewardLoopManagerBase):
     @staticmethod
     def _force_action_in_response(response_text: str, forced_action: str, forced_letter: str) -> str:
         text = str(response_text or "")
-        repl = f"{forced_action}<{forced_letter}>"
-        # New unified format: direct_answer<A> / tool_call<B> / request_for_info<C> / cannot_answer<D>
-        pat = re.compile(r"\b(direct_answer|tool_call|request_for_info|cannot_answer)\s*<\s*([ABCD])\s*>", re.IGNORECASE)
-        if pat.search(text):
-            return pat.sub(repl, text, count=1)
+        replacement = f"{forced_action}<{forced_letter}>"
+        pattern = re.compile(
+            r"\b(direct_answer|tool_call|request_for_info|cannot_answer)\s*<\s*([ABCD])\s*>",
+            re.IGNORECASE,
+        )
+        if pattern.search(text):
+            return pattern.sub(replacement, text, count=1)
         return text
 
     def _strict_ppl(self, prompt_text: str, forced_letter: str, response_text: str) -> float | None:
@@ -234,290 +265,307 @@ class PPLRewardManager(RewardLoopManagerBase):
             forced_action = self._action_from_letter(forced_letter)
             if not forced_action:
                 return None
-            force_inst = (
-                f"\n\n[Forced Action]\n"
+            force_instruction = (
+                "\n\n[Forced Action]\n"
                 f"You MUST output action tag {forced_action}<{forced_letter}> and keep content consistent with this action.\n"
             )
             forced_response = self._force_action_in_response(response_text, forced_action, forced_letter)
-            prefix = prompt_text + force_inst
-            full = prefix + "\nassistant: " + forced_response
+            prefix = prompt_text + force_instruction
+            full_text = prefix + "\nassistant: " + forced_response
 
-            tok = self._strict_tokenizer
-            model = self._strict_model
-            full_ids = tok(full, return_tensors="pt", add_special_tokens=True)
-            pref_ids = tok(prefix + "\nassistant: ", return_tensors="pt", add_special_tokens=True)
+            full_ids = self._strict_tokenizer(full_text, return_tensors="pt", add_special_tokens=True)
+            prefix_ids = self._strict_tokenizer(prefix + "\nassistant: ", return_tensors="pt", add_special_tokens=True)
 
             input_ids = full_ids["input_ids"].to(self._strict_device)
             attention_mask = full_ids.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self._strict_device)
             labels = input_ids.clone()
-            pref_len = int(pref_ids["input_ids"].shape[1])
-            labels[:, :pref_len] = -100
+            prefix_len = int(prefix_ids["input_ids"].shape[1])
+            labels[:, :prefix_len] = -100
 
             with torch.no_grad():
-                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = float(out.loss.item())
-            ppl = float(torch.exp(torch.tensor(loss)).item())
-            return ppl
+                outputs = self._strict_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = float(outputs.loss.item())
+            return float(torch.exp(torch.tensor(loss)).item())
         except Exception:
             logger.debug("strict ppl scoring failed", exc_info=True)
             return None
 
     @staticmethod
-    def _is_finite_number(val: Any) -> bool:
-        return isinstance(val, numbers.Number) and torch.isfinite(torch.tensor(float(val))).item()
+    def _is_finite_number(value: Any) -> bool:
+        return isinstance(value, numbers.Number) and torch.isfinite(torch.tensor(float(value))).item()
 
-    def _cleanup_group_margin_state(self) -> None:
-        if not self._group_margin_state:
-            return
-        now = time.time()
-        expire_before = now - max(5.0, self._group_margin_timeout_s * 10.0)
-        stale_keys = [k for k, v in self._group_margin_state.items() if v.get("created_at", now) < expire_before]
-        for key in stale_keys:
-            self._group_margin_state.pop(key, None)
+    def _apply_group_margin_fallback(self, item_infos: list[dict[str, Any]]) -> None:
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in item_infos:
+            groups[item["group_key"]].append(item)
 
-    async def _await_group_margin_terms(
+        for group_items in groups.values():
+            correct_ppls = [
+                float(item["seq_ppl"])
+                for item in group_items
+                if item.get("pred_letter") == item.get("gt_letter") and item.get("seq_ppl") is not None
+            ]
+            wrong_ppls = [
+                float(item["seq_ppl"])
+                for item in group_items
+                if item.get("pred_letter")
+                and item.get("pred_letter") != item.get("gt_letter")
+                and item.get("seq_ppl") is not None
+            ]
+
+            mean_correct = float(sum(correct_ppls) / len(correct_ppls)) if correct_ppls else None
+            mean_wrong = float(sum(wrong_ppls) / len(wrong_ppls)) if wrong_ppls else None
+            margin_source = (
+                "group_rollout:complete"
+                if len(group_items) >= self._group_margin_expected
+                else "group_rollout:partial"
+            )
+
+            for item in group_items:
+                cur_seq_ppl = item.get("seq_ppl")
+                cur_pred_letter = item.get("pred_letter") or ""
+                gt_letter = item["gt_letter"]
+
+                if item["ppl_gt"] is None:
+                    if mean_correct is not None:
+                        if cur_pred_letter == gt_letter and cur_seq_ppl is not None:
+                            item["ppl_gt"] = float(cur_seq_ppl)
+                        else:
+                            item["ppl_gt"] = float(mean_correct)
+                    else:
+                        item["ppl_gt"] = 1.0
+
+                if item["ppl_neg"] is None:
+                    if mean_wrong is not None:
+                        if cur_pred_letter and cur_pred_letter != gt_letter and cur_seq_ppl is not None:
+                            item["ppl_neg"] = float(cur_seq_ppl)
+                        else:
+                            item["ppl_neg"] = float(mean_wrong)
+                    else:
+                        item["ppl_neg"] = 1.0
+
+                if item["margin_source"] == "neutral" or item["margin_source"] == item["route_type"]:
+                    item["margin_source"] = margin_source
+
+    def _compute_sample_reward(
         self,
-        group_key: str,
-        sample_id: str,
-        gt_letter: str,
-        pred_letter: str | None,
-        seq_ppl: float | None,
-    ) -> tuple[float | None, float | None, str]:
-        if not self._group_margin_enabled or self._group_margin_expected <= 1:
-            return None, None, "disabled"
+        data_source: str,
+        response_str: str,
+        ground_truth: str,
+        extra_info: dict[str, Any],
+    ) -> Any:
+        extra_reward_kwargs: dict[str, Any] = {}
+        if self.reward_router_address is not None:
+            extra_reward_kwargs["reward_router_address"] = self.reward_router_address
+        if self.reward_model_tokenizer is not None:
+            extra_reward_kwargs["reward_model_tokenizer"] = self.reward_model_tokenizer
 
-        self._cleanup_group_margin_state()
-        state = self._group_margin_state.get(group_key)
-        if state is None:
-            state = {
-                "created_at": time.time(),
-                "event": asyncio.Event(),
-                "items": {},
-            }
-            self._group_margin_state[group_key] = state
-
-        state["items"][sample_id] = {
-            "gt_letter": gt_letter,
-            "pred_letter": (pred_letter or "").strip().upper(),
-            "seq_ppl": float(seq_ppl) if seq_ppl is not None else None,
-        }
-
-        if len(state["items"]) >= self._group_margin_expected:
-            state["event"].set()
-
-        try:
-            await asyncio.wait_for(state["event"].wait(), timeout=self._group_margin_timeout_s)
-            waited = "complete"
-        except asyncio.TimeoutError:
-            waited = "timeout"
-
-        items = list(state["items"].values())
-        correct_ppls = [
-            float(item["seq_ppl"])
-            for item in items
-            if item.get("pred_letter") == item.get("gt_letter") and item.get("seq_ppl") is not None
-        ]
-        wrong_ppls = [
-            float(item["seq_ppl"])
-            for item in items
-            if item.get("pred_letter")
-            and item.get("pred_letter") != item.get("gt_letter")
-            and item.get("seq_ppl") is not None
-        ]
-        cur = state["items"].get(sample_id, {})
-        cur_seq_ppl = cur.get("seq_ppl")
-        cur_pred_letter = cur.get("pred_letter", "")
-
-        ppl_gt = None
-        ppl_neg = None
-        if correct_ppls and wrong_ppls:
-            mean_correct = float(sum(correct_ppls) / len(correct_ppls))
-            mean_wrong = float(sum(wrong_ppls) / len(wrong_ppls))
-            if cur_pred_letter == gt_letter and cur_seq_ppl is not None:
-                ppl_gt = float(cur_seq_ppl)
-                ppl_neg = mean_wrong
-            elif cur_pred_letter and cur_pred_letter != gt_letter and cur_seq_ppl is not None:
-                ppl_gt = mean_correct
-                ppl_neg = float(cur_seq_ppl)
-            else:
-                ppl_gt = mean_correct
-                ppl_neg = mean_wrong
-        elif correct_ppls and not wrong_ppls:
-            mean_correct = float(sum(correct_ppls) / len(correct_ppls))
-            if cur_pred_letter == gt_letter and cur_seq_ppl is not None:
-                ppl_gt = float(cur_seq_ppl)
-            else:
-                ppl_gt = mean_correct
-            ppl_neg = 1.0
-        elif wrong_ppls and not correct_ppls:
-            mean_wrong = float(sum(wrong_ppls) / len(wrong_ppls))
-            ppl_gt = 1.0
-            if cur_pred_letter and cur_pred_letter != gt_letter and cur_seq_ppl is not None:
-                ppl_neg = float(cur_seq_ppl)
-            else:
-                ppl_neg = mean_wrong
-        else:
-            # No usable correct/wrong evidence in the group.
-            ppl_gt = 1.0
-            ppl_neg = 1.0
-
-        if state["event"].is_set() or waited == "timeout":
-            state["items"].pop(sample_id, None)
-            if not state["items"]:
-                self._group_margin_state.pop(group_key, None)
-
-        return ppl_gt, ppl_neg, f"group_rollout:{waited}"
-
-    async def run_single(self, data: DataProto) -> dict:
-        assert len(data) == 1, "Only support single data item"
-        data_item = data[0]
-
-        response_ids = data_item.batch["responses"]
-        response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
-        valid_response_ids = response_ids[:valid_response_length]
-
-        data_source = data_item.non_tensor_batch["data_source"]
-        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
-        if tool_extra_fields is not None:
-            extra_info.update(tool_extra_fields.items())
-
-        num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
-        rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
-        extra_info["num_turns"] = num_turns
-        extra_info["rollout_reward_scores"] = rollout_reward_scores
-        extra_info["tau"] = self._tau
-        extra_info["lambda"] = self._lambda
-
-        seq_ppl, runtime_uq = self._compute_seq_ppl_and_uq(data_item)
-        if seq_ppl is not None:
-            extra_info["runtime_seq_ppl"] = round(seq_ppl, 6)
-        if runtime_uq is not None:
-            extra_info["runtime_uq_value"] = round(runtime_uq, 6)
-
-        response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-        )
-
-        # 25% hard + 25% random route tagging and margin fields
-        from uq.answer_format import extract_mcq_letter_from_text
-
-        pred_letter = extract_mcq_letter_from_text(response_str)
-        gt_letter = self._letter_from_gt(ground_truth)
-        rollout_key = self._rollout_key(extra_info, data_item)
-        group_key = self._group_key(extra_info, data_item)
-        route_type = self._route_type(rollout_key)
-        if route_type == "hard":
-            neg_letter = self._hard_negative_map.get(gt_letter, "A")
-        elif route_type == "random":
-            neg_letter = self._pick_random_negative(gt_letter, rollout_key)
-        else:
-            neg_letter = ""
-        ppl_gt = None
-        ppl_neg = None
-        margin_source = route_type if route_type != "none" else "neutral"
-        if seq_ppl is not None and pred_letter:
-            if pred_letter == gt_letter:
-                ppl_gt = float(seq_ppl)
-            else:
-                ppl_neg = float(seq_ppl)
-        if route_type != "none":
-            # Strict per-sample scoring: same data prompt, force GT/NEG action and score sequence PPL.
-            prompt_text = self._render_prompt_text(data_item.non_tensor_batch)
-            strict_gt = self._strict_ppl(prompt_text, gt_letter, response_str)
-            strict_neg = self._strict_ppl(prompt_text, neg_letter, response_str) if neg_letter else None
-            if ppl_gt is None and strict_gt is not None:
-                ppl_gt = float(strict_gt)
-            if ppl_neg is None and strict_neg is not None:
-                ppl_neg = float(strict_neg)
-
-        if ppl_gt is None or ppl_neg is None:
-            sample_id = str(uuid.uuid4())
-            group_ppl_gt, group_ppl_neg, group_source = await self._await_group_margin_terms(
-                group_key=group_key,
-                sample_id=sample_id,
-                gt_letter=gt_letter,
-                pred_letter=pred_letter,
-                seq_ppl=seq_ppl,
-            )
-            if ppl_gt is None and group_ppl_gt is not None:
-                ppl_gt = float(group_ppl_gt)
-            if ppl_neg is None and group_ppl_neg is not None:
-                ppl_neg = float(group_ppl_neg)
-            if group_ppl_gt is not None and group_ppl_neg is not None:
-                margin_source = group_source
-
-        margin = (float(ppl_neg - ppl_gt) if (ppl_gt is not None and ppl_neg is not None) else 0.0)
-        extra_info["neg_type"] = route_type
-        extra_info["margin_source"] = margin_source
-        extra_info["gt_letter"] = gt_letter
-        if neg_letter:
-            extra_info["neg_letter"] = neg_letter
-        if ppl_gt is not None:
-            extra_info["ppl_gt"] = round(float(ppl_gt), 6)
-        if ppl_neg is not None:
-            extra_info["ppl_neg"] = round(float(ppl_neg), 6)
-        extra_info["margin"] = round(float(margin), 6)
-
-        extra_reward_kwargs: dict[str, Any] = (
-            {
-                "reward_router_address": self.reward_router_address,
-                "reward_model_tokenizer": self.reward_model_tokenizer,
-            }
-            if self.reward_router_address is not None
-            else {}
-        )
         if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
-                None,
-                lambda: self.compute_score(
+            import asyncio
+
+            return asyncio.run(
+                self.compute_score(
                     data_source=data_source,
                     solution_str=response_str,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
                     **extra_reward_kwargs,
-                ),
+                )
             )
 
-        reward_extra_info: dict[str, Any] = {}
-        score: float
-        if isinstance(result, dict):
-            score = result["score"]
-            for key, value in result.items():
-                # VERL validation computes numpy mean on collected values.
-                # Skip None and non-scalar containers to avoid TypeError.
-                if value is None:
-                    continue
-                if isinstance(value, (str, bool, numbers.Number)):
-                    reward_extra_info[key] = value
-        else:
-            score = result
-            reward_extra_info["acc"] = score
+        return self.compute_score(
+            data_source=data_source,
+            solution_str=response_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            **extra_reward_kwargs,
+        )
 
-        if runtime_uq is not None:
-            reward_extra_info["runtime_uq_value"] = round(runtime_uq, 6)
-        if seq_ppl is not None:
-            reward_extra_info["runtime_seq_ppl"] = round(seq_ppl, 6)
-        reward_extra_info["neg_type"] = route_type
-        reward_extra_info["margin_source"] = margin_source
-        reward_extra_info["margin"] = round(float(margin), 6)
-        reward_extra_info["tau"] = self._tau
-        reward_extra_info["lambda"] = self._lambda
-        if ppl_gt is not None:
-            reward_extra_info["ppl_gt"] = round(float(ppl_gt), 6)
-        if ppl_neg is not None:
-            reward_extra_info["ppl_neg"] = round(float(ppl_neg), 6)
+    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        if "rm_scores" in data.batch.keys():
+            if return_dict:
+                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
+            return data.batch["rm_scores"]
 
-        return {"reward_score": score, "reward_extra_info": reward_extra_info}
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_extra_info: dict[str, list[Any]] = defaultdict(list)
+        item_infos: list[dict[str, Any]] = []
+
+        from uq.answer_format import extract_mcq_letter_from_text
+
+        for index in range(len(data)):
+            data_item = data[index]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            valid_prompt_length = int(data_item.batch["attention_mask"][:prompt_length].sum())
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch["responses"]
+            valid_response_length = int(data_item.batch["attention_mask"][prompt_length:].sum())
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+
+            reward_model = _coerce_dict(data_item.non_tensor_batch.get("reward_model"))
+            ground_truth = str(reward_model.get("ground_truth", ""))
+            extra_info = dict(_coerce_dict(data_item.non_tensor_batch.get("extra_info")))
+            tool_extra_fields = _coerce_dict(data_item.non_tensor_batch.get("tool_extra_fields"))
+            if tool_extra_fields:
+                extra_info.update(tool_extra_fields)
+
+            num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
+            rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+            extra_info["num_turns"] = num_turns
+            extra_info["rollout_reward_scores"] = rollout_reward_scores
+            extra_info["tau"] = self._tau
+            extra_info["lambda"] = self._lambda
+
+            seq_ppl, runtime_uq = self._compute_seq_ppl_and_uq(data_item)
+            if seq_ppl is not None:
+                extra_info["runtime_seq_ppl"] = round(seq_ppl, 6)
+            if runtime_uq is not None:
+                extra_info["runtime_uq_value"] = round(runtime_uq, 6)
+
+            pred_letter = extract_mcq_letter_from_text(response_str)
+            gt_letter = self._letter_from_gt(ground_truth)
+            rollout_key = self._rollout_key(extra_info, data_item)
+            group_key = self._group_key(extra_info, data_item)
+            route_type = self._route_type(rollout_key)
+            if route_type == "hard":
+                neg_letter = self._hard_negative_map.get(gt_letter, "A")
+            elif route_type == "random":
+                neg_letter = self._pick_random_negative(gt_letter, rollout_key)
+            else:
+                neg_letter = ""
+
+            ppl_gt = None
+            ppl_neg = None
+            margin_source = route_type if route_type != "none" else "neutral"
+            if seq_ppl is not None and pred_letter:
+                if pred_letter == gt_letter:
+                    ppl_gt = float(seq_ppl)
+                else:
+                    ppl_neg = float(seq_ppl)
+
+            if route_type != "none":
+                prompt_text = self._render_prompt_text(data_item.non_tensor_batch)
+                strict_gt = self._strict_ppl(prompt_text, gt_letter, response_str)
+                strict_neg = self._strict_ppl(prompt_text, neg_letter, response_str) if neg_letter else None
+                if ppl_gt is None and strict_gt is not None:
+                    ppl_gt = float(strict_gt)
+                if ppl_neg is None and strict_neg is not None:
+                    ppl_neg = float(strict_neg)
+
+            item_infos.append(
+                {
+                    "index": index,
+                    "data_source": data_item.non_tensor_batch.get(self.reward_fn_key, ""),
+                    "ground_truth": ground_truth,
+                    "extra_info": extra_info,
+                    "response_str": response_str,
+                    "prompt_str": prompt_str,
+                    "valid_response_length": valid_response_length,
+                    "route_type": route_type,
+                    "neg_letter": neg_letter,
+                    "pred_letter": pred_letter,
+                    "gt_letter": gt_letter,
+                    "rollout_key": rollout_key,
+                    "group_key": group_key,
+                    "seq_ppl": seq_ppl,
+                    "runtime_uq": runtime_uq,
+                    "ppl_gt": ppl_gt,
+                    "ppl_neg": ppl_neg,
+                    "margin_source": margin_source,
+                }
+            )
+
+        self._apply_group_margin_fallback(item_infos)
+
+        already_print_data_sources: dict[str, int] = {}
+        max_num_turns: list[float] = []
+        tool_call_success: list[bool] = []
+
+        for item in item_infos:
+            extra_info = dict(item["extra_info"])
+            route_type = item["route_type"]
+            extra_info["neg_type"] = route_type
+            extra_info["margin_source"] = item["margin_source"]
+            extra_info["gt_letter"] = item["gt_letter"]
+            if item["neg_letter"]:
+                extra_info["neg_letter"] = item["neg_letter"]
+
+            ppl_gt = item["ppl_gt"]
+            ppl_neg = item["ppl_neg"]
+            margin = float(ppl_neg - ppl_gt) if (ppl_gt is not None and ppl_neg is not None) else 0.0
+            if ppl_gt is not None:
+                extra_info["ppl_gt"] = round(float(ppl_gt), 6)
+            if ppl_neg is not None:
+                extra_info["ppl_neg"] = round(float(ppl_neg), 6)
+            extra_info["margin"] = round(float(margin), 6)
+
+            result = self._compute_sample_reward(
+                data_source=str(item["data_source"]),
+                response_str=item["response_str"],
+                ground_truth=item["ground_truth"],
+                extra_info=extra_info,
+            )
+
+            if isinstance(result, dict):
+                reward = result["score"]
+                for key, value in result.items():
+                    if value is None:
+                        reward_extra_info[key].append(None)
+                    elif isinstance(value, (str, bool, numbers.Number)):
+                        reward_extra_info[key].append(value)
+            else:
+                reward = result
+                reward_extra_info["acc"].append(reward)
+
+            valid_response_length = int(item["valid_response_length"])
+            if valid_response_length > 0:
+                reward_tensor[item["index"], valid_response_length - 1] = float(reward)
+
+            num_turns_value = extra_info.get("num_turns")
+            try:
+                num_turns_value = int(num_turns_value) if num_turns_value is not None else 1
+            except Exception:
+                num_turns_value = 1
+            if num_turns_value <= 0:
+                num_turns_value = 1
+
+            max_num_turns.append(float(num_turns_value))
+            tool_call_success.append(True)
+
+            data_source = str(item["data_source"])
+            already_print_data_sources.setdefault(data_source, 0)
+            if already_print_data_sources[data_source] < self.num_examine:
+                already_print_data_sources[data_source] += 1
+                print("[prompt]", item["prompt_str"])
+                print("[response]", item["response_str"])
+                print("[ground_truth]", item["ground_truth"])
+                print("[route_type]", route_type)
+                print("[margin_source]", item["margin_source"])
+                if self._is_finite_number(ppl_gt):
+                    print("[ppl_gt]", round(float(ppl_gt), 6))
+                if self._is_finite_number(ppl_neg):
+                    print("[ppl_neg]", round(float(ppl_neg), 6))
+                print("[score]", reward)
+
+        reward_extra_info["max_num_turns"] = torch.as_tensor(
+            max_num_turns,
+            device=reward_tensor.device,
+            dtype=reward_tensor.dtype,
+        )
+        reward_extra_info["tool_call_success"] = torch.as_tensor(
+            tool_call_success,
+            device=reward_tensor.device,
+            dtype=torch.bool,
+        )
+
+        if return_dict:
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+        return reward_tensor

@@ -99,6 +99,77 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _patch_multiprocessing_authkey() -> None:
+    """Use a shared multiprocessing authkey across Ray workers and SGLang subprocesses.
+
+    SGLang weight sync serializes CUDA tensors with Python multiprocessing internals.
+    Under Ray, different worker processes can end up with different authkeys, and
+    deserializing a tensor produced by another worker then fails with
+    ``multiprocessing.context.AuthenticationError``.
+
+    Pinning a deterministic authkey makes the IPC hand-off consistent across
+    rollout workers and the scheduler subprocesses launched by SGLang.
+    """
+
+    authkey_text = os.getenv("VERL_SGLANG_SHARED_AUTHKEY", "trust-sglang-shared-authkey-v1")
+    if not authkey_text:
+        return
+
+    authkey = authkey_text.encode("utf-8")
+
+    try:
+        proc = mp.current_process()
+        if getattr(proc, "authkey", None) != authkey:
+            proc.authkey = authkey
+    except Exception:
+        return
+
+    try:
+        import multiprocessing.process as mp_process
+
+        proc = mp_process.current_process()
+        if getattr(proc, "authkey", None) != authkey:
+            proc.authkey = authkey
+    except Exception:
+        pass
+
+
+def _patch_sglang_torch_reductions_for_torch28() -> None:
+    """Guard sglang 0.5.x torch reduction monkey patch against torch 2.8 tuple layout changes."""
+    try:
+        from torch.multiprocessing import reductions
+        from sglang.srt.utils import patch_torch as sgl_patch_torch
+    except Exception:
+        return
+
+    if getattr(sgl_patch_torch, "_verl_safe_modify_tuple", False):
+        return
+
+    original_modifier = getattr(sgl_patch_torch, "_modify_tuple", None)
+    if original_modifier is None:
+        return
+
+    def _safe_modify_tuple(t, index: int, modifier):
+        if index >= len(t):
+            return t
+        return (*t[:index], modifier(t[index]), *t[index + 1 :])
+
+    sgl_patch_torch._modify_tuple = _safe_modify_tuple
+    sgl_patch_torch._verl_safe_modify_tuple = True
+
+    # If sglang already patched torch reductions in this process, rebind the
+    # wrappers so future reduce/rebuild calls use the guarded tuple modifier.
+    if hasattr(reductions, "_reduce_tensor_original"):
+        reductions.reduce_tensor = sgl_patch_torch._reduce_tensor_modified
+        reductions.rebuild_cuda_tensor = sgl_patch_torch._rebuild_cuda_tensor_modified
+
+
+async def _safe_sgl_update_weights(**kwargs):
+    _patch_multiprocessing_authkey()
+    _patch_sglang_torch_reductions_for_torch28()
+    return await sgl_update_weights(**kwargs)
+
+
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -108,6 +179,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    os.environ.setdefault("SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
+    os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
+
+    _patch_multiprocessing_authkey()
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -135,6 +210,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+_patch_multiprocessing_authkey()
 
 
 # because chatCompletion is an async method, it makes the whole ray actor be an async actor
@@ -1813,7 +1889,7 @@ class SGLangRollout(BaseRollout):
         """
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
         for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-            await sgl_update_weights(
+            await _safe_sgl_update_weights(
                 engine=self._engine,
                 params_batch=params_batch,
                 device_mesh_key="infer_tp",
@@ -1907,7 +1983,7 @@ class ServerAdapter(BaseRollout):
 
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
         for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-            await sgl_update_weights(
+            await _safe_sgl_update_weights(
                 engine=self._engine,
                 params_batch=params_batch,
                 device_mesh_key="infer_tp",

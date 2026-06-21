@@ -62,6 +62,14 @@ def _ensure_list(val: Any) -> list:
         return []
     if isinstance(val, list):
         return val
+    if isinstance(val, tuple):
+        return list(val)
+    if hasattr(val, "tolist") and not isinstance(val, (str, bytes)):
+        try:
+            converted = val.tolist()
+            return converted if isinstance(converted, list) else []
+        except Exception:
+            return []
     if isinstance(val, str):
         try:
             parsed = json.loads(val)
@@ -114,7 +122,13 @@ class When2CallGRPODataset(RLHFDataset):
     """RLHFDataset that parses extra_info and prompt from JSON when loaded as strings."""
 
     def _read_files_and_tokenize(self):
+        original_filter_flag = self.filter_overlong_prompts
+        # The base RLHFDataset filters before our rows are normalized. For parquet files
+        # with ndarray-backed chat messages, that can incorrectly drop every sample.
+        self.filter_overlong_prompts = False
         super()._read_files_and_tokenize()
+        self.filter_overlong_prompts = original_filter_flag
+
         filter_limit = self.max_prompt_length
         response_budget = 0
         try:
@@ -136,7 +150,7 @@ class When2CallGRPODataset(RLHFDataset):
                 rollout_limit = max(1, rollout_limit - response_budget)
             filter_limit = min(filter_limit, rollout_limit)
 
-        if filter_limit < self.max_prompt_length:
+        if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
 
@@ -161,8 +175,7 @@ class When2CallGRPODataset(RLHFDataset):
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than rollout limit {filter_limit} tokens",
             )
+            print(f"filter dataset len: {len(self.dataframe)}")
 
         # Wrap after full init so __getitem__ and split() receive parsed rows.
-        # Must wrap before any DataLoader access; filter already ran on raw data
-        # (our prepare script has short prompts, so filter keeps all).
         self.dataframe = _ParsedDataset(self.dataframe)

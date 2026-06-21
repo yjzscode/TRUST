@@ -8,7 +8,7 @@ fi
 FORMAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$FORMAL_ROOT/src:$FORMAL_ROOT/third_party/verl_v0.6.1_checklist:$FORMAL_ROOT/third_party:${PYTHONPATH:-}"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV="${RAY_ENABLE_UV_RUN_RUNTIME_ENV:-0}"
-export RAY_TMPDIR="${RAY_TMPDIR:-/mnt/shared-storage-user/zhouyijin/tmp}"
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/trust_ray}"
 MODE="${1:?usage: bash run_job.sh <train> <config.yaml>}"
 CONFIG_INPUT="${2:?usage: bash run_job.sh <train> <config.yaml>}"
 if [[ "$CONFIG_INPUT" = /* ]]; then

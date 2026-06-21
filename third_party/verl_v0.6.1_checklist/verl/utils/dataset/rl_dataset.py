@@ -24,6 +24,7 @@ from typing import Optional
 
 import datasets
 import numpy as np
+import pandas as pd
 import torch
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
@@ -152,8 +153,9 @@ class RLHFDataset(Dataset):
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            # Load via pandas/pyarrow first to fully bypass HuggingFace parquet
+            # builder cache and version-specific dataset_info metadata parsing.
+            dataframe = datasets.Dataset.from_pandas(pd.read_parquet(parquet_file), preserve_index=False)
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 

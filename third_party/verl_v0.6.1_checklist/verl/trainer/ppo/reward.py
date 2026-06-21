@@ -41,6 +41,8 @@ def _maybe_import_external_reward_manager(reward_manager_name: str) -> None:
     """Import externally-defined reward managers so registry lookups also work in Ray workers."""
     if reward_manager_name == "mixed":
         import v3.train.rewards.mixed_reward_manager  # noqa: F401
+    elif reward_manager_name == "ppl_uq":
+        import v2.train.ppl_reward_manager  # noqa: F401
 
 
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):

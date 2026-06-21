@@ -12,12 +12,12 @@ train:
   CM2_VAL_AUG_OUTPUT_FILE: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/data/v3/build-cm2-aug-balanced/cm2_augmented/cm2_when2call_augmented_val.parquet
   CM2_AUG_BALANCED_OUTPUT_FILE: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/data/v3/build-cm2-aug-balanced/mixed/cm2_aug_only_balanced_train.parquet
   CM2_AUG_BALANCED_VAL_OUTPUT_FILE: /mnt/shared-storage-user/ai4good1-share/zhouyijin/uq2as_formal/data/v3/build-cm2-aug-balanced/mixed/cm2_aug_only_balanced_val.parquet
-  LABEL_MODEL_NAME: Qwen/Qwen3-235B-A22B-Instruct-2507
-  LABEL_BASE_URL: http://YOUR_LABEL_SERVER/v1
+  LABEL_MODEL_NAME: Qwen/235b
+  LABEL_BASE_URL: http://100.99.203.14:58629/v1
   LABEL_API_KEY: YOUR_LABEL_API_KEY
   LABEL_WORKERS: 16
-  SGLANG_URL: http://YOUR_JUDGE_SERVER/v1/chat/completions
-  JUDGE_MODEL_NAME: Qwen/Qwen3-30B-A3B-Instruct-2507
+  SGLANG_URL: http://100.99.203.14:58629/v1
+  JUDGE_MODEL_NAME: Qwen/235b
   JUDGE_API_KEY: YOUR_JUDGE_API_KEY
   JUDGE_WORKERS: 64
   RAY_TMPDIR: /mnt/shared-storage-user/zhouyijin/tmp

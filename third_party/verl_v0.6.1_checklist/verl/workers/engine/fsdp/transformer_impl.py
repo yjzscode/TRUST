@@ -638,8 +638,6 @@ class FSDPEngine(BaseEngine):
                 layered_summon=layered_summon,
                 base_sync_done=base_sync_done,
             )
-            if not base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.module.state_dict()
 
