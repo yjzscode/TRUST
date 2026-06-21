@@ -11,7 +11,7 @@ __pycache__/
 outputs/
 
 # cofigs with key
-configs/
+# configs/
 
 # Large / non-code release-excluded artifacts
 *.pdf
