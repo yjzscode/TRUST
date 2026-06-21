@@ -12,6 +12,7 @@ outputs/
 
 # cofigs with key
 # configs/
+configs/train_open/
 
 # Large / non-code release-excluded artifacts
 *.pdf

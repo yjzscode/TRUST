@@ -2,34 +2,27 @@ job:
   target: when2call_grpo
 env:
   vars:
-    CONDA_ENV_TRAIN: uq2as_train
+    CONDA_ENV_TRAIN: base
 train:
-  MODEL: /mnt/shared-storage-user/ai4good1-share/zhouyijin/models/Qwen/Qwen3-4B-Thinking-2507
+  MODEL: /models/Qwen/Qwen3-4B-Thinking-2507
   TRAINER_PROJECT_NAME: when2call_grpo_8H
   TRAINER_EXPERIMENT_NAME: when2call_ablation_full_no_neg_rollout_mean
-  TRAIN_OUTPUT_ROOT: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/outputs/when2call_open
-  TRAINER_DEFAULT_LOCAL_DIR: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/outputs/when2call_open/checkpoints/when2call/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
-  TENSORBOARD_DIR: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/outputs/when2call_open/tensorboard/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
-  WHEN2CALL_GRPO_OUTPUT_DIR: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/outputs/when2call_open/grpo
-  RAY_TMPDIR: /tmp/trust_ray
+  TRAIN_OUTPUT_ROOT: /uq2as_formal
+  TRAINER_DEFAULT_LOCAL_DIR: /uq2as_formal/checkpoints/when2call/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
+  TENSORBOARD_DIR: /uq2as_formal/tensorboard/when2call_grpo_8H/when2call_ablation_full_no_neg_rollout_mean
+  WHEN2CALL_GRPO_OUTPUT_DIR: /uq2as_formal/data/when2call_official/grpo
+  RAY_TMPDIR: /tmp
   REWARD_NEG_ROUTE_MODE: none
   REWARD_DROP_COMPONENTS: ""
-  TOTAL_EPOCHS: 1
-  BATCH_SIZE: 1
-  N_SAMPLES: 4
-  NUM_CPUS: 64
+  TOTAL_EPOCHS: 2
+  BATCH_SIZE: 16
+  N_SAMPLES: 16
+  NUM_CPUS: 32
   NUM_GPUS: 4
   MAX_RESPONSE: 1024
   ROLLOUT_MAX_MODEL_LEN: 3072
-  ROLLOUT_MAX_BATCHED_TOKENS: 4096
-  ROLLOUT_MAX_NUM_SEQS: 2
-  ROLLOUT_AGENT_NUM_WORKERS: 1
-  GPU_MEMORY_UTILIZATION: 0.6
-  ACTOR_PARAM_OFFLOAD: True
-  ACTOR_OPTIMIZER_OFFLOAD: True
-  REF_PARAM_OFFLOAD: True
-  MODEL_ATTN_IMPLEMENTATION: eager
-  MODEL_USE_REMOVE_PADDING: true
+  ROLLOUT_MAX_BATCHED_TOKENS: 6144
+  ROLLOUT_MAX_NUM_SEQS: 32
 paths:
-  output_root: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/outputs/when2call_open
-  log_root: /mnt/shared-storage-user/zhouyijin/workspace/MyProj/UQ/formal_version_open/logs
+  output_root: /uq2as_formal
+  log_root: formal_version_open/logs
