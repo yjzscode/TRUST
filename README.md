@@ -11,8 +11,8 @@ This repository contains the core open-source pipeline of TRUST. The current rel
 If this repository is useful for your research, please consider starring it.
 
 ## Updates
-
-- [2026-06-08] Our paper and code are released!
+📆[2026-08-21] 🎈 Our paper has been accepted to EMNLP Conference. See you in Budapest🇭🇺! 🎈
+📆[2026-06-08] 🎈 Our paper and code are released! 🎈
 
 ## Introduction
 
